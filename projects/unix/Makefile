@@ -141,6 +141,8 @@ else
   CFLAGS += -fno-PIC
 endif
 
+CFLAGS += -fvisibility=hidden
+
 ifeq ($(BIG_ENDIAN), 1)
   CFLAGS += -DM64P_BIG_ENDIAN
 endif
@@ -488,8 +490,9 @@ endif
 
 ifeq ($(OSD), 1)
 SOURCE += \
-	$(SRCDIR)/osd/OGLFT.cpp \
+	$(SRCDIR)/osd/gl3w.cpp \
 	$(SRCDIR)/osd/osd.cpp
+LDFLAGS += -lSDL2_ttf
 endif
 
 # source files for optional features
@@ -668,7 +671,7 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.cpp
 	$(COMPILE.cc) -o $@ $<
 
 $(TARGET): $(OBJECTS)
-	$(LINK.o) $^ $(LOADLIBES) $(LDLIBS) -o $@
+	$(LINK.o) $^ $(LOADLIBES) $(LDLIBS) -o $@ -fvisibility=hidden
 	if [ "$(SONAME)" != "" ]; then ln -sf $@ $(SONAME); fi
 
 .PHONY: all clean install uninstall targets

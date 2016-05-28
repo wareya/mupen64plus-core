@@ -21,14 +21,15 @@
 
 #include <SDL.h>
 // On-screen Display
-#include <SDL_opengl.h>
+#include "gl3w.h"
 #include <SDL_thread.h>
+#include <SDL_ttf.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
-#include "OGLFT.h"
 #include "api/m64p_types.h"
 #include "osd.h"
 
@@ -46,6 +47,102 @@ extern "C" {
     #include "plugin/plugin.h"
 }
 
+GLuint program;
+
+GLuint vao[1];
+GLuint vbo[2];
+
+GLfloat vertcoords[8]; // set in procedure
+const char * gl3_vertshader =
+"attribute vec2 position;              \n"
+"attribute vec2 coord;                 \n"
+"varying vec2 fragcoord;               \n"
+"uniform vec2 scaleport;               \n"
+
+"void main(void) {                     \n"
+"    vec2 pos = position*scaleport;    \n"
+"    pos -= 1.0;                       \n"
+"    gl_Position = vec4(pos, 1.0, 1.0);\n"
+"    fragcoord = coord;                \n"
+"}";
+
+GLfloat texcoords[] = {
+    0.0f, 0.0f,
+    1.0f, 0.0f,
+    0.0f, 1.0f,
+    1.0f, 1.0f
+};
+const char * gl3_fragshader =
+"varying vec2 fragcoord;                     \n"
+"uniform sampler2D texture;                  \n"
+
+"void main(void) {                           \n"
+"    vec4 t = texture2D(texture, fragcoord); \n"
+"    t.rgb *= t.a;                           \n"
+"    gl_FragColor = vec4(t.r, t.g, t.b, t.a);\n"
+"}";
+
+struct Font {
+    float red;
+    float green;
+    float blue;
+    float alpha;
+    TTF_Font * font = NULL;
+    float height() { return TTF_FontHeight(font); }
+    bool isValid() { return font != NULL; }
+    void setForegroundColor
+    (   float _red   = 0.0,
+        float _green = 0.0,
+        float _blue  = 0.0,
+        float _alpha = 1.0 )
+    {
+        red   = _red;
+        green = _green;
+        blue  = _blue;
+        alpha = _alpha;
+    }
+    void draw (int align, float x, float y, const char * text, float sizebox[4])
+    {
+        SDL_Surface * temp = TTF_RenderUTF8_Blended(font, text, {255,255,255});
+        if(!temp) return;
+        
+        GLuint texture;
+        glUniform1i(glGetUniformLocation(program, "texture"), 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, temp->w, temp->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, temp->pixels);
+        
+        if(align == OSD_TOP_CENTER  or align == OSD_MIDDLE_CENTER or align == OSD_BOTTOM_CENTER) x -= temp->w/2;
+        if(align == OSD_TOP_RIGHT   or align == OSD_MIDDLE_RIGHT  or align == OSD_BOTTOM_RIGHT)  x -= temp->w;
+        if(align == OSD_MIDDLE_LEFT or align == OSD_MIDDLE_CENTER or align == OSD_MIDDLE_RIGHT)  y -= temp->h/2;
+        //if(align == OSD_TOP_LEFT    or align == OSD_TOP_CENTER    or align == OSD_TOP_RIGHT)     y -= temp->h;
+        if(align == OSD_BOTTOM_LEFT    or align == OSD_BOTTOM_CENTER    or align == OSD_BOTTOM_RIGHT)     y -= temp->h;
+        
+        vertcoords[0] = x;
+        vertcoords[1] = y;
+        vertcoords[2] = x+temp->w;
+        vertcoords[3] = y;
+        vertcoords[4] = x;
+        vertcoords[5] = y+temp->h;
+        vertcoords[6] = x+temp->w;
+        vertcoords[7] = y+temp->h;
+        SDL_FreeSurface(temp);
+        
+        glBindBuffer(GL_ARRAY_BUFFER, vbo[0]);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertcoords), vertcoords);
+        
+        glEnable(GL_BLEND);
+        glBlendColor(red, green, blue, alpha); // TODO: test
+        glBlendFuncSeparate(GL_CONSTANT_COLOR, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+};
+
+Font * l_font;
+
 #define FONT_FILENAME "font.ttf"
 
 typedef void (APIENTRYP PTRGLACTIVETEXTURE)(GLenum texture);
@@ -55,7 +152,6 @@ static PTRGLACTIVETEXTURE pglActiveTexture = NULL;
 static int l_OsdInitialized = 0;
 
 static LIST_HEAD(l_messageQueue);
-static OGLFT::Monochrome *l_font;
 static float l_fLineHeight = -1.0;
 
 static void animation_none(osd_message_t *);
@@ -83,75 +179,50 @@ static void draw_message(osd_message_t *msg, int width, int height)
     if(!l_font || !l_font->isValid())
         return;
 
-    // set color. alpha is hard coded to 1. animation can change this
-    l_font->setForegroundColor(msg->color[R], msg->color[G], msg->color[B], 1.0);
-    l_font->setBackgroundColor(0.0, 0.0, 0.0, 0.0);
-
     // set justification based on corner
     switch(msg->corner)
     {
         case OSD_TOP_LEFT:
-            l_font->setVerticalJustification(OGLFT::Face::TOP);
-            l_font->setHorizontalJustification(OGLFT::Face::LEFT);
             x = 0.;
             y = (float)height;
             break;
         case OSD_TOP_CENTER:
-            l_font->setVerticalJustification(OGLFT::Face::TOP);
-            l_font->setHorizontalJustification(OGLFT::Face::CENTER);
             x = ((float)width)/2.0f;
             y = (float)height;
             break;
         case OSD_TOP_RIGHT:
-            l_font->setVerticalJustification(OGLFT::Face::TOP);
-            l_font->setHorizontalJustification(OGLFT::Face::RIGHT);
             x = (float)width;
             y = (float)height;
             break;
         case OSD_MIDDLE_LEFT:
-            l_font->setVerticalJustification(OGLFT::Face::MIDDLE);
-            l_font->setHorizontalJustification(OGLFT::Face::LEFT);
             x = 0.;
             y = ((float)height)/2.0f;
             break;
         case OSD_MIDDLE_CENTER:
-            l_font->setVerticalJustification(OGLFT::Face::MIDDLE);
-            l_font->setHorizontalJustification(OGLFT::Face::CENTER);
             x = ((float)width)/2.0f;
             y = ((float)height)/2.0f;
             break;
         case OSD_MIDDLE_RIGHT:
-            l_font->setVerticalJustification(OGLFT::Face::MIDDLE);
-            l_font->setHorizontalJustification(OGLFT::Face::RIGHT);
             x = (float)width;
             y = ((float)height)/2.0f;
             break;
         case OSD_BOTTOM_LEFT:
-            l_font->setVerticalJustification(OGLFT::Face::BOTTOM);
-            l_font->setHorizontalJustification(OGLFT::Face::LEFT);
             x = 0.;
             y = 0.;
             break;
         case OSD_BOTTOM_CENTER:
-            l_font->setVerticalJustification(OGLFT::Face::BOTTOM);
-            l_font->setHorizontalJustification(OGLFT::Face::CENTER);
             x = ((float)width)/2.0f;
             y = 0.;
             break;
         case OSD_BOTTOM_RIGHT:
-            l_font->setVerticalJustification(OGLFT::Face::BOTTOM);
-            l_font->setHorizontalJustification(OGLFT::Face::RIGHT);
             x = (float)width;
             y = 0.;
             break;
         default:
-            l_font->setVerticalJustification(OGLFT::Face::BOTTOM);
-            l_font->setHorizontalJustification(OGLFT::Face::LEFT);
             x = 0.;
             y = 0.;
             break;
-    }
-
+    }   
     // apply animation for current message state
     (*l_animations[msg->animation[msg->state]])(msg);
 
@@ -160,18 +231,8 @@ static void draw_message(osd_message_t *msg, int width, int height)
     // yoffset moves message up
     y += msg->yoffset;
 
-    // get the bounding box if invalid
-    if (msg->sizebox[0] == 0 && msg->sizebox[2] == 0)  // xmin and xmax
-    {
-        OGLFT::BBox bbox = l_font->measure_nominal(msg->text);
-        msg->sizebox[0] = bbox.x_min_;
-        msg->sizebox[1] = bbox.y_min_;
-        msg->sizebox[2] = bbox.x_max_;
-        msg->sizebox[3] = bbox.y_max_;
-    }
-
     // draw the text line
-    l_font->draw(x, y, msg->text, msg->sizebox);
+    l_font->draw(msg->corner, x, y, msg->text, msg->sizebox);
 }
 
 // null animation handler
@@ -224,6 +285,14 @@ extern "C"
 void osd_init(int width, int height)
 {
     const char *fontpath;
+    if(gl3wInit()) {
+        DebugMessage(M64MSG_ERROR, "Failed to load gl3w");
+        return;
+    }
+    if(TTF_Init()) {
+        DebugMessage(M64MSG_ERROR, "Failed to load SDL2_TTF");
+        return;
+    }
 
     osd_list_lock = SDL_CreateMutex();
     if (!osd_list_lock) {
@@ -231,30 +300,71 @@ void osd_init(int width, int height)
         return;
     }
 
-    if (!OGLFT::Init_FT())
-    {
-        DebugMessage(M64MSG_ERROR, "Could not initialize freetype library.");
-        return;
-    }
-
     fontpath = ConfigGetSharedDataFilepath(FONT_FILENAME);
-
-    l_font = new OGLFT::Monochrome(fontpath, (float) height / 35.0f);  // make font size proportional to screen height
-
+    
+    l_font = new Font;
+    l_font->font = TTF_OpenFont(fontpath, height / 35.0f);
+    puts(SDL_GetError());
+    
     if(!l_font || !l_font->isValid())
     {
-        DebugMessage(M64MSG_ERROR, "Could not construct face from %s", fontpath);
+        DebugMessage(M64MSG_ERROR, "Could not load font from %s", fontpath);
         return;
     }
+
+    auto vert_shader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vert_shader, 1, &gl3_vertshader, NULL);
+    glCompileShader(vert_shader);
+    
+    GLint success;
+    glGetShaderiv(vert_shader, GL_COMPILE_STATUS, &success);
+    if(!success)
+    {
+        GLchar infoLog[512];
+        glGetShaderInfoLog(vert_shader, 512, NULL, infoLog);
+        DebugMessage(M64MSG_ERROR, "Failed to compile vert shader. %s", infoLog);
+        assert(false);
+    }
+    
+    auto frag_shader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(frag_shader, 1, &gl3_fragshader, NULL);
+    glCompileShader(frag_shader);
+    
+    program = glCreateProgram();
+    glAttachShader(program, vert_shader);
+    glAttachShader(program, frag_shader);
+    glLinkProgram(program);
+    
+    glDeleteShader(vert_shader);
+    glDeleteShader(frag_shader);
+    
+    glGenVertexArrays(1, vao);
+    glGenBuffers(2, vbo);
+    
+    GLint former_vao, former_vbo;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &former_vao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &former_vbo);
+    
+    glBindVertexArray(vao[0]);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, vbo[0]); // rect coord
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertcoords), vertcoords, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo[1]); // tex coord
+    glBufferData(GL_ARRAY_BUFFER, sizeof(texcoords), texcoords, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
 
     // clear statics
     for (int i = 0; i < OSD_NUM_CORNERS; i++)
         fCornerScroll[i] = 0.0;
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-#if defined(GL_RASTER_POSITION_UNCLIPPED_IBM)
-    glEnable(GL_RASTER_POSITION_UNCLIPPED_IBM);
-#endif
+    
+    glBindBuffer(GL_ARRAY_BUFFER, former_vbo);
+    glBindVertexArray(former_vao);
 
     pglActiveTexture = (PTRGLACTIVETEXTURE) VidExt_GL_GetProcAddress("glActiveTexture");
     if (pglActiveTexture == NULL)
@@ -271,10 +381,11 @@ extern "C"
 void osd_exit(void)
 {
     osd_message_t *msg, *safe;
-
+    
     // delete font renderer
     if (l_font)
     {
+        TTF_CloseFont(l_font->font);
         delete l_font;
         l_font = NULL;
     }
@@ -288,10 +399,9 @@ void osd_exit(void)
     }
     SDL_UnlockMutex(osd_list_lock);
 
-    // shut down the Freetype library
-    OGLFT::Uninit_FT();
-
     SDL_DestroyMutex(osd_list_lock);
+
+    TTF_Quit();
 
     // reset initialized flag
     l_OsdInitialized = 0;
@@ -307,64 +417,24 @@ void osd_render()
     // if we're not initialized or list is empty, then just skip it all
     if (!l_OsdInitialized || list_empty(&l_messageQueue))
         return;
+    
+    GLint former_vao, former_vbo;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &former_vao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &former_vbo);
+    
+    glUseProgram(program);
+    glBindVertexArray(vao[0]);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+    glDisable(GL_CULL_FACE);
 
     // get the viewport dimensions
     GLint viewport[4];
     glGetIntegerv(GL_VIEWPORT, viewport);
-
-    // save all the attributes
-    glPushAttrib(GL_ALL_ATTRIB_BITS);
-    bool bFragmentProg = glIsEnabled(GL_FRAGMENT_PROGRAM_ARB) != 0;
-    bool bColorArray = glIsEnabled(GL_COLOR_ARRAY) != 0;
-    bool bTexCoordArray = glIsEnabled(GL_TEXTURE_COORD_ARRAY) != 0;
-    bool bSecColorArray = glIsEnabled(GL_SECONDARY_COLOR_ARRAY) != 0;
-
-    // deactivate all the texturing units
-    GLint  iActiveTex;
-    bool bTexture2D[8];
-    glGetIntegerv(GL_ACTIVE_TEXTURE_ARB, &iActiveTex);
-    for (i = 0; i < 8; i++)
-    {
-        pglActiveTexture(GL_TEXTURE0_ARB + i);
-        bTexture2D[i] = glIsEnabled(GL_TEXTURE_2D) != 0;
-        glDisable(GL_TEXTURE_2D);
-    }
-
-    // save the matrices and set up new ones
-    glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
-    glLoadIdentity();
-    gluOrtho2D(viewport[0],viewport[2],viewport[1],viewport[3]);
-
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glLoadIdentity();
-
-    // setup for drawing text
-    glDisable(GL_FOG);
-    glDisable(GL_LIGHTING);
-    glDisable(GL_ALPHA_TEST);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_FRAGMENT_PROGRAM_ARB);
-    glDisable(GL_COLOR_MATERIAL);
-
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    glDisableClientState(GL_COLOR_ARRAY);
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisableClientState(GL_SECONDARY_COLOR_ARRAY);
-    glShadeModel(GL_FLAT);
-
-    // get line height if invalid
-    if (l_fLineHeight < 0.0)
-    {
-        OGLFT::BBox bbox = l_font->measure("01abjZpqRGB");
-        l_fLineHeight = (bbox.y_max_ - bbox.y_min_) / 30.0f;
-    }
+    GLfloat scaleport[2];
+    scaleport[0] = 2.0f/viewport[2];
+    scaleport[1] = -2.0f/viewport[3];
+    glUniform2fv(glGetUniformLocation(program, "scaleport"), 1, scaleport);
 
     // keeps track of next message position for each corner
     float fCornerPos[OSD_NUM_CORNERS];
@@ -401,11 +471,11 @@ void osd_render()
             fStartOffset = fCornerPos[msg->corner];
         else
             fStartOffset = fCornerPos[msg->corner] + (fCornerScroll[msg->corner] * l_fLineHeight);
-        msg->yoffset += get_message_offset(msg, fStartOffset);
-
+            
+        msg->yoffset = get_message_offset(msg, fStartOffset);
+        msg->xoffset = 0;
         draw_message(msg, viewport[2], viewport[3]);
-
-        msg->yoffset -= get_message_offset(msg, fStartOffset);
+        
         fCornerPos[msg->corner] += l_fLineHeight;
     }
     SDL_UnlockMutex(osd_list_lock);
@@ -417,34 +487,11 @@ void osd_render()
         if (fCornerScroll[i] >= 0.0)
             fCornerScroll[i] = 0.0;
     }
-
-    // restore the matrices
-    glMatrixMode(GL_MODELVIEW);
-    glPopMatrix();
-    glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
-
-    // restore the attributes
-    for (int i = 0; i < 8; i++)
-    {
-        pglActiveTexture(GL_TEXTURE0_ARB + i);
-        if (bTexture2D[i])
-            glEnable(GL_TEXTURE_2D);
-        else
-            glDisable(GL_TEXTURE_2D);
-    }
-    pglActiveTexture(iActiveTex);
-    glPopAttrib();
-    if (bFragmentProg)
-        glEnable(GL_FRAGMENT_PROGRAM_ARB);
-    if (bColorArray)
-        glEnableClientState(GL_COLOR_ARRAY);
-    if (bTexCoordArray)
-        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    if (bSecColorArray)
-        glEnableClientState(GL_SECONDARY_COLOR_ARRAY);
-
+    
     glFinish();
+    
+    glBindBuffer(GL_ARRAY_BUFFER, former_vbo);
+    glBindVertexArray(former_vao);
 }
 
 // creates a new osd_message_t, adds it to the message queue and returns it in case
